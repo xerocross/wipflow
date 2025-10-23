@@ -7,6 +7,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Iterable
 
+VERSION = "0.3.1"
+
+
 # --- Optional niceties ---
 try:
     from rich.console import Console
@@ -23,15 +26,49 @@ try:
 except Exception:
     _HAS_RAPID = False
 
-# --- Storage locations ---
-ODIN_ROOT_CONFIG = Path.home() / ".config" / "odin" / "root.txt"
-with open(ODIN_ROOT_CONFIG, 'r') as f:
-    odin_root_str = f.read().strip()
-odin_path = Path(odin_root_str).resolve()
 
-APP_DIR = odin_path / "wipflow"
-EVENTS = APP_DIR / "events.jsonl"
-VERSION = "0.3.0"
+# --- Storage locations ---
+CONFIG_PATH = Path.home() / ".config" / "wipflow" / "config.txt"
+
+def _load_config_data_path() -> Path:
+    if not CONFIG_PATH.exists():
+        sys.exit(f"Config file not found: {CONFIG_PATH}")
+
+    try:
+        raw = CONFIG_PATH.read_text(encoding="utf-8")
+    except Exception as e:
+        sys.exit(f"Failed to read config file {CONFIG_PATH}: {e}")
+
+    cfg = {}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            # ignore malformed lines silently; could also sys.exit if you prefer strict
+            continue
+        k, v = line.split("=", 1)
+        cfg[k.strip()] = v.strip()
+
+    data_path_str = cfg.get("data_file_path")
+    if not data_path_str:
+        sys.exit(f"Missing 'data_file_path' key in config {CONFIG_PATH}")
+
+    # Expand ~ and environment variables, then resolve
+    p = Path(os.path.expandvars(os.path.expanduser(data_path_str))).resolve()
+
+    # We don't require the file to exist yet (init may create it), but ensure parent dir is sensible
+    parent = p.parent
+    if not parent.exists():
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            sys.exit(f"Cannot create parent directory for data file {p}: {e}")
+
+    return p
+
+EVENTS = _load_config_data_path()         # full path to events.jsonl (or your chosen file)
+APP_DIR = EVENTS.parent   
 
 # ---------- Event Sourcing ----------
 
@@ -312,14 +349,31 @@ def cmd_move(args, st, to: ProjectState):
     p = st.projects.get(args.id)
     if not p:
         sys.exit("No such item.")
-    if to == "queued" and p.state == "active":
-        append_event("item_moved", id=p.id, to="queued"); print(f"Paused {p.id} → queued (token returned)")
-    elif to == "completed" and p.state == "active":
-        append_event("item_moved", id=p.id, to="completed"); print(f"Completed {p.id} ✓ (token returned)")
-    elif to == "killed" and p.state == "active":
-        append_event("item_moved", id=p.id, to="killed"); print(f"Killed {p.id} (token returned)")
-    else:
-        sys.exit(f"Cannot move {p.id} from {p.state} to {to}. Use 'start' for queued→active.")
+
+    if to == "queued":
+        if p.state == "active":
+            append_event("item_moved", id=p.id, to="queued")
+            print(f"Paused {p.id} → queued (token returned)")
+        else:
+            sys.exit(f"Cannot move {p.id} from {p.state} to queued. Use 'start' for queued→active.")
+
+    elif to == "completed":
+        if p.state == "active":
+            append_event("item_moved", id=p.id, to="completed")
+            print(f"Completed {p.id} ✓ (token returned)")
+        else:
+            sys.exit(f"Only active items can be completed (current state: {p.state}).")
+
+    elif to == "killed":
+        # ✅ allow killing from active OR queued
+        if p.state in ("active", "queued"):
+            append_event("item_moved", id=p.id, to="killed")
+            if p.state == "active":
+                print(f"Killed {p.id} (token returned)")
+            else:
+                print(f"Killed {p.id} (was queued; no token involved)")
+        else:
+            sys.exit(f"Only active or queued items can be killed (current state: {p.state}).")
 
 def cmd_reopen(args, st):
     """Reverse accidental completed/killed. Back to queued by default, or --to active if token free."""
@@ -442,7 +496,7 @@ def main():
     p_complete.set_defaults(func=lambda a, st: cmd_move(a, st, "completed"))
 
     # kill: alias for move <id> killed
-    p_kill = sub.add_parser("kill", help="Mark active item as killed (token returns)")
+    p_kill = sub.add_parser("kill", help="Mark item as killed (from active or queued)")
     p_kill.add_argument("id")
     p_kill.set_defaults(func=lambda a, st: cmd_move(a, st, "killed"))
 
